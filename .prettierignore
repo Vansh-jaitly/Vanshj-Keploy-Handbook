@@ -1,0 +1,7 @@
+.next
+out
+node_modules
+source
+package-lock.json
+content/*.mdx
+AGENTS.md

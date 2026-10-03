@@ -1,0 +1,24 @@
+# dependencies
+node_modules/
+
+# next.js build output
+.next/
+out/
+
+# env files
+.env*
+
+# private run notes and raw material (never committed)
+source/
+
+# logs
+*.log
+
+# misc
+.DS_Store
+*.tsbuildinfo
+next-env.d.ts
+.vercel
+
+# stray local notes – not part of the site
+notes (1).md
