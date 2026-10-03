@@ -1,0 +1,749 @@
+<HeroTerminal />
+
+## TL;DR
+
+<Callout type="info" title="In one minute">
+
+I ran Keploy's Echo + Postgres quickstart on Windows through WSL2. Keploy sat in front of a small Go URL shortener, watched my API calls, and saved each one as a test. It also saved every Postgres reply as a mock. Then I replayed the tests, stopped the database, and replayed them again.
+
+**What you'll have at the end:**
+
+- 8 test cases recorded from 7 curl calls and one stray browser visit
+- a suite that passes 8/8 with Postgres switched off
+- a regression caught on purpose: a one-word change from 308 to 307 failed exactly the two redirect tests
+
+</Callout>
+
+## Why Keploy
+
+Testing an API that talks to a database usually means one of two chores: keep a real database running for every test run, or hand-write mocks and hope they still match what the database says. Both drift, and both cost time.
+
+Keploy records real traffic instead, and turns each request into a test and each database exchange into a mock. My pitch to a Go developer:
+
+> Keploy turns the API calls you already make into tests and records your database's answers as mocks, without touching your code. Run it once while you click around, and you get a regression suite that runs without Postgres.
+
+
+## How it works
+
+Keploy starts your app and sits on both sides of it: in front of the app for incoming requests, and in front of Postgres, through its proxy, for database traffic. So it sees both halves of every request.
+
+<ArchitectureDiagram />
+
+<Callout type="aha" title="Zero code changes">
+
+The app has no Keploy SDK. The only Keploy line in `main.go` is commented out: `// kecho.EchoV4(k, r)`. I didn't change any Go code to get tests.
+
+</Callout>
+
+## Meet the sample app
+
+A URL shortener built with Echo and Postgres. I read the code before running anything, so I'd know what correct output looks like.
+
+<EndpointTable
+  rows={[
+    { method: "POST", path: "/url", response: "200 {\"ts\":…, \"url\":\"…/4KepjkTT\"}", quirk: "Body {} gives 400 \"Missing URL parameter\"" },
+    { method: "GET", path: "/:param", response: "308 Permanent Redirect", quirk: "Unknown code gives 404 \"Invalid URL ID.\"" },
+    { method: "PUT", path: "/:param", response: "200 {\"rows_affected\":N}", quirk: "Unknown id still returns 200, with an error message in the body" },
+    { method: "DELETE", path: "/:param", response: "200 {\"rows_affected\":N}", quirk: "Unknown id returns 200 with rows_affected: 0" },
+  ]}
+/>
+
+Two details matter later. Every handler pings the database first, and the app creates its own `url_map` table at startup. And only the `ts` field changes between requests (it's `time.Now().UnixNano()`).
+
+<Callout type="tip" title="The short code is deterministic">
+
+It's the SHA-256 of the URL, base58-encoded, first 8 characters. `https://github.com` always becomes `4KepjkTT`.
+
+</Callout>
+
+<Callout type="info" title="308, not 302">
+
+`GET` redirects with `http.StatusPermanentRedirect`: **308 Permanent Redirect**, not 302. Remember it. I break it on purpose later.
+
+</Callout>
+
+## Prerequisites
+
+I used Go 1.26, Docker 29.8.1 (Docker Desktop), git and curl. Pick your OS:
+
+<Tabs labels={["Windows (WSL2)", "Linux", "macOS"]} label="Operating system">
+<Tab>
+
+The setup I tested: Ubuntu 26.04 in WSL2.
+
+1. **Use the Ubuntu terminal, not PowerShell.** The prompt should look like `user@host:~$`. A prompt showing `\\wsl.localhost\Ubuntu\...` is still PowerShell.
+2. **Turn on Docker's WSL integration.** In Docker Desktop: Settings → Resources → WSL Integration → enable Ubuntu.
+3. **Let your Ubuntu user talk to Docker:**
+
+```bash
+sudo usermod -aG docker $USER
+```
+
+Then run `wsl --shutdown` in PowerShell, reopen Ubuntu, and check `docker ps`.
+
+4. **Install a C toolchain.** Go's cgo needs C headers, and a fresh Ubuntu lacks them:
+
+```bash
+sudo apt install -y build-essential
+```
+
+</Tab>
+<Tab>
+
+I didn't run this on native Linux. Two fixes from my WSL run should still apply: add your user to the `docker` group (`sudo usermod -aG docker $USER`, then log out and back in), and install `build-essential` if `go build` complains about missing C headers.
+
+</Tab>
+<Tab>
+
+The quickstart recommends its Docker Compose route on macOS. I didn't test that route, so follow the [official quickstart](https://keploy.io/docs/quickstart/samples-echo/) for it.
+
+</Tab>
+</Tabs>
+
+<Callout type="warning" title="Installing Keploy">
+
+Copy the current install command from [Keploy's installation guide](https://keploy.io/docs/server/installation/) instead of from an old blog post, including this one. I used **Keploy 3.8.58, Free edition**.
+
+</Callout>
+
+## Set up the app
+
+I kept three Ubuntu terminals open the whole time: **T1** for Postgres, **T2** for Keploy and the app, **T3** for curl.
+
+<Steps>
+<Step title="Clone the sample">
+
+```bash title="T2"
+git clone https://github.com/keploy/samples-go.git && cd samples-go/echo-sql
+go mod download
+```
+
+`go mod download` fetches the Go dependencies up front, so the build step later only builds.
+
+</Step>
+<Step title="Read docker-compose.yml">
+
+These names decide which host the app can reach, so I checked them first. The **service** is `postgres`. The **container** name and network alias is `postgresDb`. Port `5432:5432`, user `postgres`, password `password`, database `postgres`. (Docker warns that the `version` attribute is obsolete. Harmless.)
+
+</Step>
+<Step title="Point the app at localhost">
+
+```bash title="T2"
+grep -n "host" main.go
+```
+
+```text
+47:             host: "localhost",
+48:             // host: "localhost" when using natively
+49:             //host:     "echo-sql-postgres-1",
+```
+
+That's the file after my edit. Here's where it differed from the quickstart:
+
+<CompareTable
+  rows={[
+    { topic: "Line to edit", docs: "line 41", mine: "line 47" },
+    { topic: "Host value", docs: "postgres", mine: "shipped as postgresDb" },
+    { topic: "What works natively", docs: "postgres", mine: "localhost" },
+  ]}
+/>
+
+Why `localhost`: on this route the Go binary runs directly in Ubuntu, outside Docker's network, where `postgresDb` doesn't resolve. Postgres publishes port 5432 to the host, so `localhost` reaches it.
+
+</Step>
+<Step title="Start Postgres">
+
+```bash title="T1"
+docker compose up postgres
+```
+
+Wait for `database system is ready to accept connections`. The app exits if it can't reach the database at startup.
+
+</Step>
+<Step title="Build the app">
+
+```bash title="T2"
+go build -o echo-psql-url-shortener
+```
+
+My first build failed with `fatal error: stdint.h: No such file or directory`. Installing `build-essential` fixed it, and the second build finished with no output. See [Troubleshooting](#troubleshooting).
+
+</Step>
+</Steps>
+
+## Record real traffic
+
+Now Keploy starts the app and listens. In T2:
+
+```bash title="T2"
+sudo env "PATH=$PATH" keploy record -c "./echo-psql-url-shortener"
+```
+
+`-c` is the command Keploy uses to start your app. The `sudo env "PATH=$PATH"` part passes my own `PATH` through `sudo`, so it finds the same binaries I do. The quickstart's `sudo -E PATH=$PATH` form broke on WSL. More on that in [Troubleshooting](#troubleshooting).
+
+<Terminal title="T2 · keploy record (trimmed)">{`
+Keploy Free: 3.8.58
+🐰 Keploy: ... INFO    Generated config file based on the flags that are used
+🐰 Keploy(agent): ... INFO    Keploy has taken control of the DNS resolution mechanism, your application may misbehave if you have provided wrong domain name in your application code.
+🐰 Keploy(agent): ... INFO    Proxy started at port:16789
+🐰 Keploy: ... INFO    Keploy agent is ready to record test cases and mocks.
+🐰 Keploy: ... INFO    Starting Application :  {"executing_cmd": "/usr/bin/sh -c ./echo-psql-url-shortener"}
+{"level":"info",...,"msg":"Ping successful"}
+{"level":"info",...,"msg":"Table creation check passed"}
+{"level":"info",...,"msg":"Database connection established successfully"}
+[Echo startup banner, v4.9.0]
+⇨ http server started on [::]:43635
+🐰 Keploy(agent): ... INFO    Started ingress forwarding      {"orig_port": 8082, "new_port": 43635}
+`}</Terminal>
+
+<Callout type="info" title="Why port 43635?">
+
+During recording the app really listened on 43635, and Keploy forwarded 8082 to it. You still send everything to 8082, and Keploy sees each request on the way in.
+
+</Callout>
+
+### Send some traffic
+
+In T3 I made seven calls, one per path through the app. Each tab shows the real response.
+
+<Tabs labels={["1 Create", "2 Again", "3 Bad input", "4 Redirect", "5 Not found", "6 Update", "7 Delete"]} label="curl calls">
+<Tab>
+<Terminal title="T3">{`
+$ curl -i -X POST http://localhost:8082/url -H 'content-type: application/json' -d '{"url": "https://github.com"}'
+HTTP/1.1 200 OK
+Content-Length: 66
+Content-Type: application/json; charset=UTF-8
+
+{"ts":1791011549050753557,"url":"http://localhost:8082/4KepjkTT"}
+`}</Terminal>
+</Tab>
+<Tab>
+<Terminal title="T3">{`
+$ curl -i -X POST http://localhost:8082/url -H 'content-type: application/json' -d '{"url": "https://github.com"}'
+HTTP/1.1 200 OK
+
+{"ts":1791011853049228523,"url":"http://localhost:8082/4KepjkTT"}
+`}</Terminal>
+
+Same code, different `ts`. Inside it's a different path: SELECT then UPDATE, where the first create was SELECT then INSERT.
+</Tab>
+<Tab>
+<Terminal title="T3">{`
+$ curl -i -X POST http://localhost:8082/url -H 'content-type: application/json' -d '{}'
+HTTP/1.1 400 Bad Request
+
+{"message":"Missing URL parameter"}
+`}</Terminal>
+</Tab>
+<Tab>
+<Terminal title="T3">{`
+$ curl -i http://localhost:8082/4KepjkTT
+HTTP/1.1 308 Permanent Redirect
+Location: https://github.com
+Content-Length: 0
+`}</Terminal>
+</Tab>
+<Tab>
+<Terminal title="T3">{`
+$ curl -i http://localhost:8082/doesnotexist
+HTTP/1.1 404 Not Found
+
+{"message":"Invalid URL ID."}
+`}</Terminal>
+</Tab>
+<Tab>
+<Terminal title="T3">{`
+$ curl -i -X PUT http://localhost:8082/4KepjkTT -H 'content-type: application/json' -d '{"url": "https://keploy.io"}'
+HTTP/1.1 200 OK
+
+{"rows_affected":1}
+`}</Terminal>
+</Tab>
+<Tab>
+<Terminal title="T3">{`
+$ curl -i -X DELETE http://localhost:8082/4KepjkTT
+HTTP/1.1 200 OK
+
+{"rows_affected":1}
+`}</Terminal>
+</Tab>
+</Tabs>
+
+### What Keploy captured
+
+Back in T2, Keploy logged a line for every test it saved:
+
+<Terminal title="T2 · captures">{`
+🐰 Keploy: 07:12:29 INFO 🟠 Keploy has captured test cases for the user's application. {"path": ".../keploy/test-set-1/tests", "testcase name": "post-url-1"}
+🐰 Keploy: 07:14:31 INFO 🟠 ... "testcase name": "get-4kepjktt-1"
+🐰 Keploy: 07:17:33 INFO 🟠 ... "testcase name": "post-url-2"
+🐰 Keploy: 07:18:32 INFO 🟠 ... "testcase name": "post-url-3"
+🐰 Keploy: 07:18:55 INFO 🟠 ... "testcase name": "get-4kepjktt-2"
+🐰 Keploy: 07:19:23 INFO 🟠 ... "testcase name": "get-doesnotexist-1"
+🐰 Keploy: 07:19:53 INFO 🟠 ... "testcase name": "put-4kepjktt-1"
+🐰 Keploy: 07:20:19 INFO 🟠 ... "testcase name": "delete-4kepjktt-1"
+`}</Terminal>
+
+<Callout type="aha" title="7 curl calls, 8 tests">
+
+The extra test, `get-4kepjktt-1` at 07:14, was me opening the short link in Brave on Windows. Its headers include `Sec-Ch-Ua: "Brave"` and `Sec-Ch-Ua-Platform: "Windows"`. Keploy records any traffic that reaches the app. (It also showed me that WSL2 forwards `localhost` from Windows into Ubuntu.)
+
+</Callout>
+
+## What happens when you stop recording
+
+I pressed `Ctrl+C` expecting Keploy to exit. Keploy 3.8.58 replayed everything it had just recorded first:
+
+<Terminal title="T2 · after Ctrl+C (trimmed)">{`
+🐰 Keploy: 07:23:46 INFO auto-replay: recording stopped — now replaying what was just recorded to check for noise. Press Ctrl+C again to skip and exit.  {"test_sets": 1, "opt_out": "--disableAutoReplay, or keploy.yml record.disableAutoReplay, to skip this on every run"}
+🐰 Keploy: 07:23:46 INFO auto-replay: effective config {"delay": 15, ..., "schemaNoiseDetection": true, ...}
+Session expired. Re-authenticating via browser...
+[browser sign-in step omitted]
+🐰 Keploy: 07:24:02 INFO running {"test-set": "test-set-1", "attempt": 1}
+... all 8 passed ...
+🐰 Keploy: 07:24:17 INFO Successfully saved test-mock mappings {"testSetID": "test-set-1", "numTests": 7, "startupMocks": 1}
+  TESTRUN SUMMARY. For test-set: "test-set-1"
+        Total tests:        8
+        Total test passed:  8
+        Total test failed:  0
+🐰 Keploy: 07:24:18 INFO Mock uploaded successfully
+🐰 Keploy: 07:24:19 INFO testReport uploaded successfully
+[hosted report link omitted]
+🐰 Keploy: 07:24:19 INFO auto-replay: completed
+`}</Terminal>
+
+Four things happened:
+
+- **Auto-replay.** Keploy ran the new tests once. The log names the opt-out: `--disableAutoReplay`, or `record.disableAutoReplay` in `keploy.yml`.
+- **Noise detection.** `schemaNoiseDetection: true` is most likely how the changing fields got marked as noise (next section).
+- **A browser login.** Recording was never blocked; the sign-in appeared during auto-replay. I signed in once and the replay continued. The page also offered Keploy MCP and an API key, which I didn't need.
+- **Uploads.** The Free edition uploaded the mocks and the test report to Keploy's servers and printed a hosted report link. Fine for a sample app; I'd think twice with real data.
+
+## Inside `keploy/`
+
+Recording filled a `keploy/` folder next to the app. One surprise: a test set was already in there.
+
+<FileTree
+  label="keploy folder"
+  items={[
+    {
+      name: "keploy/",
+      children: [
+        { name: "reports/test-run-0/test-set-1-report.yaml" },
+        {
+          name: "test-set-0/",
+          badge: "shipped with the repo",
+          badgeTone: "shipped",
+          note: "old mock format",
+          children: [{ name: "mocks.yaml" }, { name: "tests/test-1.yaml" }],
+        },
+        {
+          name: "test-set-1/",
+          badge: "mine",
+          badgeTone: "mine",
+          children: [
+            { name: "config.yaml" },
+            { name: "mappings.yaml", note: "which mocks belong to which test" },
+            { name: "mocks.yaml", note: "22 Postgres mocks" },
+            {
+              name: "tests/",
+              note: "8 files",
+              children: [
+                { name: "post-url-1.yaml" },
+                { name: "post-url-2.yaml" },
+                { name: "post-url-3.yaml" },
+                { name: "get-4kepjktt-1.yaml" },
+                { name: "get-4kepjktt-2.yaml" },
+                { name: "get-doesnotexist-1.yaml" },
+                { name: "put-4kepjktt-1.yaml" },
+                { name: "delete-4kepjktt-1.yaml" },
+              ],
+            },
+          ],
+        },
+        { name: "testReports/", children: [{ name: "report-1.yaml" }, { name: "report-2.yaml" }, { name: "report-3.yaml" }] },
+      ],
+    },
+  ]}
+/>
+
+
+### A test case is plain YAML
+
+My first test, trimmed. I wrote none of it, including the highlighted noise rules:
+
+```yaml title="keploy/test-set-1/tests/post-url-1.yaml (trimmed)" {18-20}
+# Generated by Keploy (3.8.58)
+version: api.keploy.io/v1beta1
+kind: Http
+name: post-url-1
+spec:
+  req:
+    method: POST
+    url: http://localhost:8082/url
+    header:
+      Content-Type: application/json
+      User-Agent: curl/8.18.0
+    body: '{"url": "https://github.com"}'
+  resp:
+    status_code: 200
+    body: |
+      {"ts":1791011549050753557,"url":"http://localhost:8082/4KepjkTT"}
+  assertions:
+    noise:
+      body.ts: []
+      header.Date: []
+  app_port: 8082
+curl: |-
+  curl --request POST \
+    --url http://localhost:8082/url \
+    --header 'Content-Type: application/json' \
+    --data "{\"url\": \"https://github.com\"}"
+```
+
+- **A test is the request plus the response.** Readable, editable YAML.
+- **`noise` lists fields to skip when comparing.** `body.ts` and `header.Date` change every run, which is why replay passes even though `ts` differs.
+- **Each test carries a ready-to-run `curl` command** for reproducing it by hand.
+- The redirect test `get-4kepjktt-1` recorded `status_code: 308` and `Location: https://github.com`, with only `header.Date` as noise.
+
+### Which mocks belong to which test
+
+`mappings.yaml` links every test to the database replies it needs:
+
+```yaml title="keploy/test-set-1/mappings.yaml (excerpt)"
+kind: TestMocksMapping
+test_set_id: test-set-1
+tests:
+    - id: post-url-1
+      mock_entries:
+        - name: mock-4
+          kind: PostgresV3
+        - name: mock-5
+          kind: PostgresV3
+    - id: get-4kepjktt-1
+      mock_entries:
+        - name: mock-7
+          kind: PostgresV3
+```
+
+The full mapping, in short:
+
+| Test | Mocks | Why |
+|---|---|---|
+| `post-url-1`, `post-url-2` | 2 each | SELECT, then INSERT or UPDATE |
+| `put-4kepjktt-1` | 2 | SELECT, then UPDATE |
+| both GETs, `get-doesnotexist-1`, `delete-4kepjktt-1` | 1 each | a single query |
+| `post-url-3` | 0 | fails validation before any SQL |
+| `startup` section | `mock-2` | needed before any request |
+
+The per-test mocks add up to 10.
+
+### The recorded Postgres conversation
+
+`mocks.yaml` holds 22 entries. Here are the first three, trimmed:
+
+```yaml title="keploy/test-set-1/mocks.yaml (first 3 of 22, trimmed)"
+kind: PostgresV3
+name: mock-0
+spec:
+    metadata:
+        lifetime: connection
+        type: config
+    postgresV3:
+        type: session
+        session:
+            protocolVersion: "3.0"
+            serverVersion: 10.5 (Debian 10.5-2.pgdg90+1)
+            observedAuthMode: md5
+---
+kind: PostgresV3
+name: mock-1
+spec:
+    postgresV3:
+        type: query
+        query:
+            class: VALIDATION
+            sqlNormalized: ;
+---
+kind: PostgresV3
+name: mock-2
+spec:
+    metadata:
+        class: DDL
+    postgresV3:
+        type: query
+        query:
+            sqlNormalized: "CREATE TABLE IF NOT EXISTS url_map (id VARCHAR(255) PRIMARY KEY, redirect_url VARCHAR(255) NOT NULL, created_at TIMESTAMP NOT NULL, updated_at TIMESTAMP NOT NULL);"
+            response:
+                commandComplete: CREATE TABLE
+```
+
+- `mock-0` is the **connection handshake**. Without it the app can't even connect during replay, as I found out the hard way.
+- `mock-1` is the driver's validation ping, `;`.
+- `mock-2` is the startup `CREATE TABLE`, with Postgres's reply.
+
+The traffic is stored as structure (query class, normalized SQL, response), not raw bytes. And the math adds up: auto-replay reported **10** per-test mocks and **12** connection and config mocks. 10 + 12 = 22, which matches `grep -c "kind:" mocks.yaml`.
+
+## Replay the tests
+
+### First try: a crash
+
+<Callout type="stuck" title="My first replay died before reaching my tests">
+
+```bash
+sudo env "PATH=$PATH" keploy test -c "./echo-psql-url-shortener"
+```
+
+<Terminal title="T2 · keploy test (trimmed)">{`
+🐰 Keploy: ... INFO    Test Sets to be Replayed        {"testSets": ["test-set-0", "test-set-1"]}
+🐰 Keploy: ... INFO    running {"test-set": "test-set-0", "attempt": 1}
+🐰 Keploy: ... ERROR   failed to unmarshal a mock yaml doc of unknown type     {"type": "Postgres"}
+... (18 of these) ...
+🐰 Keploy(agent): ... ERROR failed to mock the outgoing message {..., "error": "replayer: session RecordedIndex missing PostgresV3Session mock — cannot reply to StartupMessage"}
+{"level":"error",...,"msg":"Ping failed","error":"EOF"}
+{"level":"fatal",...,"msg":"Failed to establish connection to local PostgreSQL instance:","error":"EOF"}
+🐰 Keploy: ... ERROR   \`keploy test\` failed mid-run. ...
+`}</Terminal>
+
+Keploy replays every test set in `keploy/` by default. It started with `test-set-0`, which came with the repo in an older mock format (`Postgres`, not `PostgresV3`) that 3.8.58 couldn't read. With no handshake mock, nothing answered the app's connection. The ping got `EOF`, the app exited, and Keploy stopped before reaching `test-set-1`.
+
+</Callout>
+
+This crash taught me more than the passing runs. During replay the app wasn't talking to Postgres at all. It was talking to Keploy, and Keploy had nothing to say.
+
+### The fix: replay only my test set
+
+```bash title="T2" /--test-sets test-set-1/
+sudo env "PATH=$PATH" keploy test -c "./echo-psql-url-shortener" --test-sets test-set-1 --delay 10
+```
+
+`--test-sets` picks which sets to run. `--delay 10` gives the app 10 seconds to start before Keploy sends the first request.
+
+<Terminal title="T2 · keploy test --test-sets test-set-1 (trimmed)">{`
+🐰 Keploy: ... INFO starting test for {"test case": "post-url-1", "test set": "test-set-1"}
+🐰 Keploy: ... INFO result  {"testcase id": "post-url-1", "testset id": "test-set-1", "passed": "true"}
+... (same for all 8) ...
+  TESTRUN SUMMARY. For test-set: "test-set-1"
+        Total tests:        8
+        Total test passed:  8
+        Total test failed:  0
+🐰 Keploy: ... INFO IT metrics successfully sent (with billing) {"appID": "echo-sql", "testsRan": 8, "mocksConsumed": 11, ...}
+`}</Terminal>
+
+<RunSummary runs={[{ title: "Replay, Postgres running", description: "test-set-1 only", total: 8, passed: 8, failed: 0, mocks: 11 }]} />
+
+
+<Callout type="warning" title="Trust per-test results, not a closing banner">
+
+After the crashed run above, the CLI still printed a closing summary that claimed all tests passed. Read the per-test `"passed": "true"` lines and the `TESTRUN SUMMARY` block instead.
+
+</Callout>
+
+## The a-ha: database off, still green
+
+This is the step that changed how I see Keploy. I stopped Postgres completely and ran the same replay.
+
+<Terminal title="T1 + T2">{`
+$ docker compose down
+$ docker ps
+$ sudo env "PATH=$PATH" keploy test -c "./echo-psql-url-shortener" --test-sets test-set-1 --delay 10
+`}</Terminal>
+
+Proof the database was gone, taken just before the replay: Postgres logs `database system is shut down`, the container and network are removed, and `docker ps` lists nothing.
+
+<Screenshot
+  src="/screenshots/docker-down-proof.png"
+  alt="Terminal: Postgres logs a smart shutdown and 'database system is shut down'. Then docker compose down removes container postgresDb and network echo-sql_babab, and docker ps shows only the header row with no containers."
+  width={1917}
+  height={422}
+  caption="docker compose down, then docker ps with no containers, at 07:39 UTC."
+/>
+
+The result was identical to the run with Postgres up:
+
+<RunSummary
+  runs={[
+    { title: "Postgres running", description: "docker compose up postgres", total: 8, passed: 8, failed: 0, mocks: 11 },
+    { title: "Postgres stopped", description: "after docker compose down", total: 8, passed: 8, failed: 0, mocks: 11 },
+  ]}
+/>
+
+The app started, "connected", "pinged", "created its table" and answered every request with **no database running**. Every Postgres reply came from the mocks, handshake included. Even the DELETE test passed, though that row was deleted during recording: replay answers come from what was recorded, not from live state.
+
+<Callout type="aha" title="What this buys you">
+
+The database becomes optional at test time. I can rebuild the app and replay the suite without Postgres and without touching real data.
+
+</Callout>
+
+## Break it on purpose
+
+A suite is only useful if it fails when it should. So I made the smallest change I could think of, in `handler.go` inside `GetURL`:
+
+```diff title="handler.go (GetURL)"
+- http.StatusPermanentRedirect
++ http.StatusTemporaryRedirect
+```
+
+Then I rebuilt and replayed:
+
+```bash title="T2"
+go build -o echo-psql-url-shortener
+sudo env "PATH=$PATH" keploy test -c "./echo-psql-url-shortener" --test-sets test-set-1 --delay 10
+```
+
+<Terminal title="T2 · keploy test after the change (trimmed)">{`
+Testrun failed for testcase with id: "get-4kepjktt-1"
+┌──────────────────────────────────────────────────────────┐
+│                     GET - 4 KEPJKTT - 1                  │
+├──────────────────────────────────────────────────────────┤
+│        EXPECT STATUS          │        ACTUAL STATUS     │
+│ ──────────────────────────────┼───────────────────────── │
+│             308               │            307           │
+└──────────────────────────────────────────────────────────┘
+Testrun failed for testcase with id: "get-4kepjktt-2"
+   (same 308 vs 307 diff)
+🐰 Keploy: ... INFO Retrying passing test cases to validate mock consistency {"replay": 1, "remaining_tests": 6}
+  COMPLETE TESTRUN SUMMARY.
+        Total tests: 8
+        Total test passed: 6
+        Total test failed: 2
+        Test Suite Name   Total Test   Passed   Failed   Failed Testcases
+        "test-set-1"      8            6        2        "get-4kepjktt-2, get-4kepjktt-1"
+`}</Terminal>
+
+<Screenshot
+  src="/screenshots/308-vs-307-failure-table.png"
+  alt="Keploy failure tables for GET 4KEPJKTT 1 and 2, each showing expect status 308 and actual status 307, followed by log lines where get-4kepjktt-1 and get-4kepjktt-2 report passed false and the other tests report passed true."
+  width={1915}
+  height={817}
+  caption="The real failure output. Both redirect tests expect 308 and get 307; every other test passes."
+/>
+
+<RunSummary runs={[{ title: "Replay after 308 → 307", description: "test-set-1", total: 8, passed: 6, failed: 2 }]} />
+
+Exactly the two redirect tests failed. The diff names the field and both values, and Keploy re-ran the passing tests to check mock consistency before reporting.
+
+Why it matters: 308 vs 307 compiles fine and is easy to miss in review, but it changes how clients and caches treat the redirect. Keploy caught it with zero hand-written assertions.
+
+Then I reverted to `http.StatusPermanentRedirect`, rebuilt, and replayed:
+
+<Terminal title="T2 · after reverting (trimmed)">{`
+🐰 Keploy: ... INFO result  {"testcase id": "post-url-1", "testset id": "test-set-1", "passed": "true"}
+🐰 Keploy: ... INFO result  {"testcase id": "get-4kepjktt-1", "testset id": "test-set-1", "passed": "true"}
+... (same for all 8, including get-4kepjktt-2 which failed with 307) ...
+  COMPLETE TESTRUN SUMMARY.
+        Total tests: 8
+        Total test passed: 8
+        Total test failed: 0
+        Test Suite Name   Total Test   Passed   Failed   Time Taken
+        "test-set-1"      8            8        0        "10.08 s"
+`}</Terminal>
+
+Back to green: 8/8 in 10.08 s, same as before the break.
+
+## Troubleshooting
+
+Every problem I hit, in the order I hit them. Paste part of an error into the filter to jump to it.
+
+<Troubleshooting>
+<Problem title="sudo is disabled on this machine" error="sudo is disabled on this machine">
+
+**Cause:** I ran the command in PowerShell, which uses Windows' own `sudo`.
+
+**Fix:** Don't enable Windows sudo. Open the Ubuntu terminal; the prompt should look like `user@host:~$`. A PowerShell prompt showing `\\wsl.localhost\Ubuntu\...` is still PowerShell.
+
+</Problem>
+<Problem title="Pasted a placeholder literally" error={"The '<' operator is reserved for future use\nbash: syntax error near unexpected token 'newline'"}>
+
+**Cause:** I pasted placeholder text like `<postgres-service-name>` as-is.
+
+**Fix:** Replace placeholders, angle brackets included, with real values. Here that was `postgres`.
+
+</Problem>
+<Problem title="Permission denied on the Docker socket" error="permission denied while trying to connect to the docker API at unix:///var/run/docker.sock">
+
+**Cause:** My Ubuntu user wasn't allowed to use Docker.
+
+**Fix:** In Docker Desktop, turn on Settings → Resources → WSL Integration → Ubuntu. Then run `sudo usermod -aG docker $USER`, run `wsl --shutdown` in PowerShell, reopen Ubuntu, and check `docker ps`.
+
+</Problem>
+<Problem title="go build can't find C headers" error="fatal error: stdint.h: No such file or directory">
+
+The same error showed up for `pthread.h` and `stdio.h`.
+
+**Cause:** A fresh Ubuntu has gcc but no C library headers, and Go's cgo needs them.
+
+**Fix:** `sudo apt install -y build-essential`
+
+</Problem>
+<Problem title="sudo -E PATH=$PATH breaks on WSL" error={"sudo: preserving the entire environment is not supported, '-E' is ignored\nsudo: 'Files/Common': command not found"}>
+
+**Cause:** WSL appends the Windows `PATH`, which contains spaces (for example `Program Files`). The unquoted `PATH=$PATH` splits at the space. This `sudo` also doesn't support `-E`.
+
+**Fix:** Quote it: `sudo env "PATH=$PATH" keploy ...`. Or use `sudo $(which keploy) ...`.
+
+</Problem>
+<Problem title="First keploy test crashes on test-set-0" error={"failed to unmarshal a mock yaml doc of unknown type {\"type\": \"Postgres\"}\nmissing PostgresV3Session mock — cannot reply to StartupMessage"}>
+
+The first error repeated 18 times, then the app exited with `EOF`.
+
+**Cause:** The cloned repo ships an old `keploy/test-set-0` in a mock format 3.8.58 can't read. Keploy replays it first, and the app can't connect.
+
+**Fix:** Replay only your own set with `--test-sets test-set-1`.
+
+</Problem>
+<Problem title="A browser sign-in opens mid-run" error="Session expired. Re-authenticating via browser...">
+
+**Cause:** The Keploy CLI session login, triggered during auto-replay after recording.
+
+**Fix:** Sign in once and return to the terminal; the replay continues. You don't need Keploy MCP or an API key for local record and replay.
+
+</Problem>
+</Troubleshooting>
+
+## Docs gaps I'd fix
+
+The quickstart got me there. These are the changes I'd suggest:
+
+1. **Host line:** it says line 41 and `postgres`. My clone had line 47, shipped as `postgresDb`; the native route needs `localhost`.
+2. **Windows/WSL:** a short note on which terminal to use, Docker's WSL integration and the `docker` group.
+3. **C toolchain:** `go build` needs `build-essential` on a fresh Ubuntu.
+4. **`sudo -E PATH=$PATH`:** breaks when the Windows `PATH` has spaces, and on `sudo` builds without `-E`. `sudo env "PATH=$PATH"` works.
+5. **Bundled `test-set-0`:** it breaks replay on 3.8.58. Suggest `--test-sets`, or remove the old set.
+6. **Login, auto-replay, uploads:** none are mentioned. A heads-up before the first run would help.
+7. **How `ts` is ignored:** the docs say it "would automatically be ignored" but not how. Point to the `noise` block.
+8. **`docker-compose`:** current Docker uses `docker compose`. Both worked for me.
+
+## Honest notes
+
+What I'd want to know before using this on a real project:
+
+- **Account friction:** a browser login mid-run, not explained in the quickstart.
+- **Data leaves the machine:** the Free edition uploaded mocks and a test report. Think first with real user data.
+- **Loud logs:** DNS takeover notices, Java truststore messages for a Go app, matching diagnostics. Useful for debugging, noisy for a beginner.
+- **Matching isn't always exact:** Keploy tolerated driver-level parameter type drift and said so. Worth remembering if a replayed response looks wrong.
+- **Tests reflect recorded state:** great for isolation, but you only test the traffic you recorded.
+- **`mocks.yaml` grows fast:** 22 entries for 8 requests, and Keploy's guidance is not to commit it to Git.
+- **Every test set runs by default,** so a stale set can break a clean run.
+- **Summary blocks aimed at AI agents** appear in the output; one claimed success after a crash.
+- The `"error":"sync /dev/stderr: invalid argument"` line at exit comes from the app's logger, not Keploy. Harmless.
+
+## Recap and next steps
+
+What I did:
+
+1. Pointed the sample app at `localhost` and built it.
+2. Recorded 7 curl calls (plus one browser visit) as 8 tests and 22 mocks, with no code changes.
+3. Replayed them 8/8, then 8/8 again with Postgres stopped.
+4. Broke one status code and watched exactly the two redirect tests fail.
+
+Before running it, I thought Keploy was a normal API or QA automation tool. Now I understand how it stands in for external dependencies locally. Replay is my favorite part: rebuild the Go app, replay, and never touch a database or precious data.
+
+
+Where I'd go next:
+
+- **Record more endpoints and edge cases.** The suite is only as good as your recording session.
+- **Tune noise.** Look at the `noise` block in each test, and at the project-wide [`keploy.yml` configuration](https://keploy.io/docs/running-keploy/configuration-file/).
+- **Run it in CI.** Keploy documents a [GitHub Actions setup](https://keploy.io/docs/ci-cd/github/). I haven't tried it yet.
+- **Read the official quickstart** this tutorial is based on: [Echo + Postgres sample](https://keploy.io/docs/quickstart/samples-echo/).
